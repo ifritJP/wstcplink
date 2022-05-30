@@ -1,0 +1,16 @@
+# -*- coding:utf-8 -*-
+#+AUTHOR: ifritJP
+#+STARTUP: nofold
+
+#+TITLE: Connecting a WebSocket client and the a TCP client
+
+The wstcplink program connects a WebSocket client and the a TCP client.
+
+* usage 
+
+: $ wstcplink server <wsserver> <tcpserver>
+
+* exsample
+
+: ./wstcplink server :10000 :10001  
+
