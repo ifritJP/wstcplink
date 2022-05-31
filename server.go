@@ -136,8 +136,9 @@ type LinkParam struct {
 	linkChan    chan bool
 }
 
-func TransProc(reader io.Reader, writer io.Writer, syncChan chan bool) {
-	io.Copy(writer, reader)
+func TransProc(title string, reader io.Reader, writer io.Writer, syncChan chan bool) {
+	len, err := io.Copy(writer, reader)
+	log.Printf("%s: %d, %v", title, len, err)
 	syncChan <- true
 }
 
@@ -149,8 +150,8 @@ func LinkProc(linkParam *LinkParam) {
 
 		log.Printf("link -- start")
 
-		go TransProc(wsConn, tcpConn, syncChan)
-		go TransProc(tcpConn, wsConn, syncChan)
+		go TransProc("ws -> tcp", wsConn, tcpConn, syncChan)
+		go TransProc("tcp -> ws", tcpConn, wsConn, syncChan)
 
 		<-syncChan
 		<-syncChan
