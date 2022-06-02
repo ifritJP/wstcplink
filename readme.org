@@ -8,9 +8,11 @@ The wstcplink program connects a WebSocket client and the a TCP client.
 
 * usage 
 
-: $ wstcplink server <wsserver> <tcpserver>
+: $ wstcplink server pair [pair...]
+:      pair : wsserver,tcpserver
+:              e.g. localhost:10000,localhost:10001  or :10000,:10001
 
 * exsample
 
-: ./wstcplink server :10000 :10001  
+: ./wstcplink server :10000,:10001  :20000,:20001  
 
