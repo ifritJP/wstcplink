@@ -29,19 +29,24 @@ func (info *HostInfo) toStr() string {
 	return fmt.Sprintf("%s%s:%d%s", info.Scheme, info.Name, info.Port, info.Path)
 }
 
+type LinkPort struct {
+	// websocket サーバ情報
+	wsServerInfo HostInfo
+	// tcp サーバ情報
+	tcpServerInfo HostInfo
+}
+
 // tunnel の制御パラメータ
 type TunnelParam struct {
 	// 接続可能な IP パターン。
 	// nil の場合、 IP 制限しない。
-	maskedIP *MaskIP
-	// サーバ情報
-	wsServerInfo HostInfo
-	// サーバ情報
-	tcpServerInfo HostInfo
+	maskedIP   *MaskIP
+	maxSession int
 }
 
 func listenTcpServer(
-	local net.Listener, param *TunnelParam, process func(connInfo io.ReadWriteCloser)) {
+	local net.Listener, param *TunnelParam, tcpServerInfo HostInfo,
+	process func(connInfo io.ReadWriteCloser)) {
 	conn, err := local.Accept()
 	if err != nil {
 		log.Fatal(err)
@@ -51,7 +56,7 @@ func listenTcpServer(
 	remoteAddr := fmt.Sprintf("%s", conn.RemoteAddr())
 	log.Print("connected -- ", remoteAddr)
 	if err := AcceptClient(remoteAddr, param); err != nil {
-		log.Printf("unmatch ip -- %s", remoteAddr)
+		log.Printf("%v", err)
 		time.Sleep(3 * time.Second)
 		return
 	}
@@ -61,19 +66,19 @@ func listenTcpServer(
 }
 
 func StartServer(
-	param *TunnelParam, tcpConnChan chan io.ReadWriteCloser, synChan chan bool) {
-	log.Print("waiting --- ", param.tcpServerInfo.toStr())
-	local, err := net.Listen("tcp", param.tcpServerInfo.toStr())
+	param *TunnelParam, tcpServerInfo HostInfo, linkDataChan *LinkDataChan) {
+	log.Print("waiting --- ", tcpServerInfo.toStr())
+	local, err := net.Listen("tcp", tcpServerInfo.toStr())
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer local.Close()
 
 	for {
-		listenTcpServer(local, param,
+		listenTcpServer(local, param, tcpServerInfo,
 			func(connInfo io.ReadWriteCloser) {
-				tcpConnChan <- connInfo
-				<-synChan
+				linkDataChan.connChan <- connInfo
+				<-linkDataChan.endChan
 			})
 	}
 }
@@ -103,7 +108,7 @@ func (handler WrapWSHandler) ServeHTTP(w http.ResponseWriter, req *http.Request)
 }
 
 func execWebSocketServer(
-	param TunnelParam,
+	param TunnelParam, wsServerInfo HostInfo,
 	connectSession func(conn io.ReadWriteCloser, param *TunnelParam)) {
 	handle := func(ws *websocket.Conn, remoteAddr string) {
 		connectSession(ws, &param)
@@ -111,54 +116,130 @@ func execWebSocketServer(
 
 	wrapHandler := WrapWSHandler{handle, &param}
 
-	http.Handle("/", wrapHandler)
-	err := http.ListenAndServe(param.wsServerInfo.toStr(), nil)
+	var srv http.Server
+	srv.Handler = wrapHandler
+	srv.Addr = wsServerInfo.toStr()
+	err := srv.ListenAndServe()
 	if err != nil {
 		panic("ListenAndServe: " + err.Error())
 	}
+
+	// http.Handle("/", wrapHandler)
+	// err := http.ListenAndServe(wsServerInfo.toStr(), nil)
+	// if err != nil {
+	// 	panic("ListenAndServe: " + err.Error())
+	// }
 }
 
 func StartWebsocketServer(
-	param *TunnelParam, wsConnChan chan io.ReadWriteCloser, synChan chan bool) {
-	log.Print("start websocket -- ", param.wsServerInfo.toStr())
+	param *TunnelParam, wsServerInfo HostInfo, linkDataChan *LinkDataChan) {
+	log.Print("start websocket -- ", wsServerInfo.toStr())
 
 	execWebSocketServer(
-		*param,
+		*param, wsServerInfo,
 		func(connInfo io.ReadWriteCloser, tunnelParam *TunnelParam) {
-			wsConnChan <- connInfo
-			<-synChan
+			linkDataChan.connChan <- connInfo
+			<-linkDataChan.endChan
 		})
 }
 
-type LinkParam struct {
-	wsConnChan  chan io.ReadWriteCloser
-	tcpConnChan chan io.ReadWriteCloser
-	linkChan    chan bool
+type LinkDataChan struct {
+	connChan      chan io.ReadWriteCloser
+	writerChan    chan io.Writer
+	fromDataChan  chan LinkBuf
+	toDataChan    chan LinkBuf
+	endChan       chan io.ReadWriteCloser
+	currentWriter io.Writer
 }
 
-func TransProc(title string, reader io.Reader, writer io.Writer, syncChan chan bool) {
-	len, err := io.Copy(writer, reader)
-	log.Printf("%s: %d, %v", title, len, err)
-	syncChan <- true
+type LinkBuf struct {
+	buf []byte
+	len int
+}
+
+type LinkParam struct {
+	wsLinkDataChan  LinkDataChan
+	tcpLinkDataChan LinkDataChan
+}
+
+func createLinkBuf() LinkBuf {
+	size := 64 * 1024
+	return LinkBuf{
+		buf: make([]byte, size),
+		len: size,
+	}
+}
+
+func createLinkDataChan() LinkDataChan {
+	linkDataChan := LinkDataChan{
+		connChan:      make(chan io.ReadWriteCloser, 1),
+		writerChan:    make(chan io.Writer, 2),
+		fromDataChan:  make(chan LinkBuf, 2),
+		toDataChan:    make(chan LinkBuf, 2),
+		endChan:       make(chan io.ReadWriteCloser, 1),
+		currentWriter: nil,
+	}
+	// websocket の 1 フレームの最大 64KB 分のバッファを登録
+	linkDataChan.fromDataChan <- createLinkBuf()
+	linkDataChan.fromDataChan <- createLinkBuf()
+	return linkDataChan
+}
+
+func CreateLinkParam() *LinkParam {
+	return &LinkParam{
+		wsLinkDataChan:  createLinkDataChan(),
+		tcpLinkDataChan: createLinkDataChan(),
+	}
+}
+
+func writeLink(
+	title string, linkDataChan *LinkDataChan, anotherDataChan *LinkDataChan) {
+	for {
+		writer := <-linkDataChan.writerChan
+		log.Printf("%s: write -- start", title)
+		for {
+			buf := <-linkDataChan.toDataChan
+			log.Printf("%s: write -- buf, %d", title, buf.len)
+			for writer != linkDataChan.currentWriter {
+				log.Printf("%s: change writer, %v", title, linkDataChan.currentWriter)
+				writer = <-linkDataChan.writerChan
+			}
+			_, err := writer.Write(buf.buf[0:buf.len])
+			anotherDataChan.fromDataChan <- buf
+			if err != nil {
+				break
+			}
+		}
+		log.Printf("%s: write -- end", title)
+	}
+}
+
+func readLink(
+	title string, linkDataChan *LinkDataChan, anotherDataChan *LinkDataChan) {
+	go writeLink(title, linkDataChan, anotherDataChan)
+	for {
+		stream := <-linkDataChan.connChan
+		log.Printf("%s: read -- start", title)
+		linkDataChan.currentWriter = stream
+		linkDataChan.writerChan <- stream
+		for {
+			buf := <-linkDataChan.fromDataChan
+			size, err := stream.Read(buf.buf)
+			if err != nil {
+				linkDataChan.currentWriter = nil
+				linkDataChan.fromDataChan <- buf
+				break
+			} else {
+				buf.len = size
+				anotherDataChan.toDataChan <- buf
+			}
+		}
+		log.Printf("%s: read -- end", title)
+		linkDataChan.endChan <- stream
+	}
 }
 
 func LinkProc(linkParam *LinkParam) {
-	syncChan := make(chan bool, 2)
-	for {
-		wsConn := <-linkParam.wsConnChan
-		tcpConn := <-linkParam.tcpConnChan
-
-		log.Printf("link -- start")
-
-		go TransProc("ws -> tcp", wsConn, tcpConn, syncChan)
-		go TransProc("tcp -> ws", tcpConn, wsConn, syncChan)
-
-		<-syncChan
-		<-syncChan
-
-		linkParam.linkChan <- true
-		linkParam.linkChan <- true
-
-		log.Printf("link -- end")
-	}
+	go readLink("ws", &linkParam.wsLinkDataChan, &linkParam.tcpLinkDataChan)
+	go readLink("tcp", &linkParam.tcpLinkDataChan, &linkParam.wsLinkDataChan)
 }

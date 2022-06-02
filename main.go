@@ -5,20 +5,18 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io"
+
+	//"io"
 	"net/url"
 	"os"
-	"os/signal"
+
+	//"os/signal"
 	"strconv"
 	"strings"
-	"time"
+	//	"time"
 )
 
 const VERSION = "0.0.1"
-
-// 2byte の MAX。
-// ここを 65535 より大きくする場合は、WriteItem, ReadItem の処理を変更する。
-const BUFSIZE = 65535
 
 func hostname2HostInfo(name string) *HostInfo {
 	if strings.Index(name, "://") == -1 {
@@ -50,10 +48,6 @@ func IsVerbose() bool {
 }
 
 func main() {
-
-	if BUFSIZE >= 65536 {
-		fmt.Printf("BUFSIZE is illegal. -- ", 65536)
-	}
 
 	var cmd = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
@@ -93,16 +87,37 @@ func main() {
 	os.Exit(1)
 }
 
+func ParsePort(arg string) *LinkPort {
+	tokenList := strings.Split(arg, ",")
+	if len(tokenList) != 2 {
+		return nil
+	}
+	wsServerInfo := hostname2HostInfo(tokenList[0])
+	if wsServerInfo == nil {
+		return nil
+	}
+	tcpServerInfo := hostname2HostInfo(tokenList[1])
+	if tcpServerInfo == nil {
+		return nil
+	}
+	return &LinkPort{
+		wsServerInfo:  *wsServerInfo,
+		tcpServerInfo: *tcpServerInfo,
+	}
+}
+
 func ParseOpt(
-	cmd *flag.FlagSet, mode string, args []string) *TunnelParam {
+	cmd *flag.FlagSet, mode string, args []string) (*TunnelParam, []*LinkPort) {
 
 	ipPattern := cmd.String("ip", "", "allow ip range (192.168.0.1/24)")
 	verbose := cmd.Bool("verbose", false, "verbose. (true or false)")
 
 	usage := func() {
-		fmt.Fprintf(cmd.Output(), "\nUsage: %s %s <wsserver> <tcpserver> ", os.Args[0], mode)
+		fmt.Fprintf(cmd.Output(), "\nUsage: %s %s pair [pair ...] ", os.Args[0], mode)
 		fmt.Fprintf(cmd.Output(), "[option] \n\n")
-		fmt.Fprintf(cmd.Output(), "   wsserver, tcpserver: e.g. localhost:1234 or :1234\n")
+		fmt.Fprintf(cmd.Output(), "   pair: wsserver and tcpserver address.\n")
+		fmt.Fprintf(cmd.Output(), "         e.g. localhost:10000,localhost:10001 or :10000,:10001\n")
+
 		fmt.Fprintf(cmd.Output(), "\n")
 		fmt.Fprintf(cmd.Output(), " options:\n")
 		cmd.PrintDefaults()
@@ -134,15 +149,15 @@ func ParseOpt(
 		usage()
 	}
 
-	wsServerInfo := hostname2HostInfo(nonFlagArgs[0])
-	if wsServerInfo == nil {
-		fmt.Print("set wsserver option!\n")
-		usage()
-	}
-	tcpServerInfo := hostname2HostInfo(nonFlagArgs[1])
-	if tcpServerInfo == nil {
-		fmt.Print("set tcpserver option!\n")
-		usage()
+	linkPortList := []*LinkPort{}
+
+	for _, nonFlagArg := range nonFlagArgs {
+		linkPort := ParsePort(nonFlagArg)
+		if linkPort == nil {
+			fmt.Print("set wsserver option!\n")
+			usage()
+		}
+		linkPortList = append(linkPortList, linkPort)
 	}
 
 	var maskIP *MaskIP = nil
@@ -158,27 +173,24 @@ func ParseOpt(
 	verboseFlag = *verbose
 
 	param := TunnelParam{
-		maskedIP:      maskIP,
-		wsServerInfo:  *wsServerInfo,
-		tcpServerInfo: *tcpServerInfo,
+		maskedIP:   maskIP,
+		maxSession: len(linkPortList) * 2,
 	}
 
-	return &param
+	return &param, linkPortList
 }
 
 func ParseOptServer(mode string, args []string) {
 	var cmd = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-	param := ParseOpt(cmd, mode, args)
+	param, linkPortList := ParseOpt(cmd, mode, args)
 
-	wsConnChan := make(chan io.ReadWriteCloser, 1)
-	tcpConnChan := make(chan io.ReadWriteCloser, 1)
-	linkChan := make(chan bool, 1)
-
-	linkParam := LinkParam{wsConnChan, tcpConnChan, linkChan}
-
-	go LinkProc(&linkParam)
-	go StartServer(param, tcpConnChan, linkChan)
-	go StartWebsocketServer(param, wsConnChan, linkChan)
+	for _, linkPort := range linkPortList {
+		linkParam := CreateLinkParam()
+		go LinkProc(linkParam)
+		go StartServer(param, linkPort.tcpServerInfo, &linkParam.tcpLinkDataChan)
+		go StartWebsocketServer(
+			param, linkPort.wsServerInfo, &linkParam.wsLinkDataChan)
+	}
 
 	endChan := make(chan bool, 1)
 	<-endChan
@@ -209,20 +221,6 @@ func ParseOptTestWSClient(args []string) {
 	}
 
 	ConnectWebScoket(fmt.Sprintf("ws://%s:%d/", wsServerInfo.Name, wsServerInfo.Port))
-}
-
-func setsignal() {
-	sigchan := make(chan os.Signal)
-	signal.Notify(sigchan, os.Interrupt)
-	fmt.Print("wait sig")
-	<-sigchan
-	fmt.Print("detect sig")
-	signal.Stop(sigchan)
-
-	for {
-		time.Sleep(time.Second)
-		fmt.Print("hoge")
-	}
 }
 
 func test() {

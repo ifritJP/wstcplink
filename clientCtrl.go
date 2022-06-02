@@ -14,8 +14,6 @@ import (
 var controlMutex = new(sync.Mutex)
 var client2count = map[string]int{}
 
-const MAX_SESSION_PER_CLIENT = 2
-
 var pattern = regexp.MustCompile(":[ 0-9]+$")
 
 type MaskIP struct {
@@ -79,7 +77,7 @@ func AcceptClient(remoteAddr string, param *TunnelParam) error {
 	}
 
 	val, has := client2count[ipTxt]
-	if has && val >= MAX_SESSION_PER_CLIENT {
+	if has && val >= param.maxSession {
 		return fmt.Errorf("session over -- %s", ipTxt)
 	}
 	log.Printf("client: '%s(%s)' -- %d", ipTxt, remoteAddr, val+1)
